@@ -312,17 +312,4 @@ The parser supports split image files (e.g., .001, .002, etc.). When working wit
 - **"Invalid MFT record"**: The Master File Table (MFT) record is corrupted or invalid.
 - **"Operation cancelled"**: The operation was cancelled by the user (Ctrl+C).
 
-## Limitations
 
-- The parser currently only supports NTFS versions 3.0 and above.
-- Some advanced NTFS features like encryption may not be fully supported.
-- Performance may degrade with extremely large volumes (>2TB).
-- The security descriptor parsing is limited to basic ACL interpretation.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 
