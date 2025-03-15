@@ -73,7 +73,7 @@ The NTFS Parser is a powerful tool for analyzing NTFS file systems, recovering d
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/ntfs_parser.git
+git clone https://github.com/lucife03/ntfs_parser_go.git
 cd ntfs_parser/go
 ```
 
