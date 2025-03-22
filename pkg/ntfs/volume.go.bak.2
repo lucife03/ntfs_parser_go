@@ -1,0 +1,1742 @@
+﻿
+package ntfs
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+)
+
+// Partition entry structure
+type PartitionEntry struct {
+	Status        byte
+	StartCHS      [3]byte
+	PartitionType byte
+	EndCHS        [3]byte
+	StartLBA      uint32
+	SectorCount   uint32
+}
+
+// NTFSVolume represents an NTFS volume
+type NTFSVolume struct {
+	devicePath        string      // Path to the volume device
+	device            *os.File    // File handle for the volume
+	bootSectorOffset  int64       // Offset to NTFS boot sector
+	bytesPerSector    int         // Bytes per sector
+	sectorsPerCluster int         // Sectors per cluster
+	bytesPerCluster   int         // Bytes per cluster
+	clusterSize       int         // Same as bytesPerCluster (for backwards compatibility)
+	totalSectors      int64       // Total sectors in volume
+	mftOffset         int64       // Offset to MFT in bytes from start of file
+	mftStart          int64       // Same as mftOffset (for backwards compatibility)
+	mftLCN            int64       // Logical Cluster Number of MFT start
+	mftMirrLCN        int64       // Logical Cluster Number of MFT mirror
+	mftRecordSize     int         // Size of each MFT record in bytes
+	sectorSize        int         // Same as bytesPerSector (for backwards compatibility)
+	volumeSize        int64       // Total size of the volume in bytes
+	bootSector        *BootSector // NTFS boot sector
+	partitionOffset   int64       // Offset to the start of the partition
+	partitionType     byte        // Partition type
+	mftRecordCount    int64       // Number of MFT records
+}
+
+// BootSector represents the NTFS boot sector
+type BootSector struct {
+	JumpInstruction       [3]byte
+	OemID                 [8]byte
+	BytesPerSector        uint16
+	SectorsPerCluster     uint8
+	ReservedSectors       uint16
+	MediaDescriptor       uint8
+	SectorsPerTrack       uint16
+	NumberOfHeads         uint16
+	HiddenSectors         uint32
+	TotalSectors          uint64
+	MftStartLcn           uint64
+	Mft2StartLcn          uint64
+	ClustersPerMftRecord  int8
+	ClustersPerIndexBlock int8
+}
+
+// NewNTFSVolume creates a new NTFSVolume instance from the provided device path.
+func NewNTFSVolume(path string) (*NTFSVolume, error) {
+	// Use the new OpenVolume function which handles boot sector detection
+	return OpenVolume(path)
+}
+
+// findNTFSBootSector attempts to locate the NTFS boot sector in the device
+// It first checks the beginning of the device, and if no valid NTFS signature is found,
+// it searches in common partition offsets
+func findNTFSBootSector(file *os.File) ([]byte, int64, error) {
+	// Common offsets where NTFS partitions might start (in sectors)
+	// 0 = start of device
+	// 63, 64, 2048 = common partition offsets
+	commonOffsets := []int64{0, 63, 64, 2048}
+	sectorSize := int64(512)
+
+	// First check MBR to see if we can find NTFS partitions
+	mbr := make([]byte, sectorSize)
+	_, err := file.ReadAt(mbr, 0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error reading MBR: %v", err)
+	}
+
+	// Check for MBR signature (0x55, 0xAA at offset 0x1FE)
+	if mbr[0x1FE] == 0x55 && mbr[0x1FF] == 0xAA {
+		fmt.Println("Found valid MBR signature")
+
+		// Parse partition table entries
+		for i := 0; i < 4; i++ {
+			entryOffset := 0x1BE + i*16
+			// Status byte is not used in our code, so not assigning it to avoid linter warning
+			// status := mbr[entryOffset]
+			partType := mbr[entryOffset+4]
+
+			// Check if NTFS partition (type 0x07)
+			if partType == 0x07 {
+				// Extract starting sector (LBA)
+				startLBA := int64(mbr[entryOffset+8]) |
+					int64(mbr[entryOffset+9])<<8 |
+					int64(mbr[entryOffset+10])<<16 |
+					int64(mbr[entryOffset+11])<<24
+
+				fmt.Printf("Found NTFS partition at sector %d (offset 0x%X)\n",
+					startLBA, startLBA*sectorSize)
+
+				// Add this offset to our common offsets to check
+				commonOffsets = append([]int64{startLBA}, commonOffsets...)
+			}
+		}
+	}
+
+	// Check each potential offset for NTFS signature
+	bootSector := make([]byte, sectorSize)
+	for _, offsetInSectors := range commonOffsets {
+		offset := offsetInSectors * sectorSize
+
+		// Reset file position
+		_, err := file.Seek(offset, 0)
+		if err != nil {
+			continue
+		}
+
+		// Read potential boot sector
+		_, err = file.ReadAt(bootSector, offset)
+		if err != nil {
+			continue
+		}
+
+		// Check for NTFS signature: "NTFS    " starting at offset 3
+		if bootSector[3] == 'N' &&
+			bootSector[4] == 'T' &&
+			bootSector[5] == 'F' &&
+			bootSector[6] == 'S' &&
+			bootSector[7] == ' ' &&
+			bootSector[8] == ' ' &&
+			bootSector[9] == ' ' &&
+			bootSector[10] == ' ' {
+			fmt.Printf("Found NTFS signature at offset 0x%X\n", offset)
+			return bootSector, offset, nil
+		}
+	}
+
+	return nil, 0, fmt.Errorf("no valid NTFS boot sector found")
+}
+
+// parseBootSector parses the NTFS boot sector and sets volume parameters.
+func (vol *NTFSVolume) parseBootSector(bootSector []byte) error {
+	// Bytes per sector (offset 0x0B, 2 bytes)
+	vol.bytesPerSector = int(bootSector[0x0B]) | int(bootSector[0x0C])<<8
+	if vol.bytesPerSector < 512 || vol.bytesPerSector > 4096 {
+		return fmt.Errorf("invalid bytes per sector: %d", vol.bytesPerSector)
+	}
+
+	// Sectors per cluster (offset 0x0D, 1 byte)
+	vol.sectorsPerCluster = int(bootSector[0x0D])
+	// Check if valid (must be power of 2 from 1 to one 128)
+	switch vol.sectorsPerCluster {
+	case 1, 2, 4, 8, 16, 32, 64, 128:
+		// Valid
+	default:
+		if bootSector[0x0D] >= 240 && bootSector[0x0D] <= 255 {
+			// Negative exponent in sectors per cluster
+			// E.g. 0xF6 means 2^(256-0xF6) = 2^10 = 1024 bytes
+			// This is used for very large (>2TB) volumes
+			exponent := 256 - int(bootSector[0x0D])
+			if exponent <= 7 { // 2^7 = 128 is the max valid value
+				vol.sectorsPerCluster = 1 << exponent
+			} else {
+				return fmt.Errorf("invalid sectors per cluster: %d (decoded from 0x%X)",
+					1<<exponent, bootSector[0x0D])
+			}
+		} else {
+			return fmt.Errorf("invalid sectors per cluster: %d", vol.sectorsPerCluster)
+		}
+	}
+
+	vol.bytesPerCluster = vol.bytesPerSector * vol.sectorsPerCluster
+
+	// Set compatibility fields
+	vol.clusterSize = vol.bytesPerCluster
+	vol.sectorSize = vol.bytesPerSector
+	vol.partitionOffset = vol.bootSectorOffset
+
+	// Total sectors (offset 0x28, 8 bytes)
+	vol.totalSectors = int64(bootSector[0x28]) |
+		int64(bootSector[0x29])<<8 |
+		int64(bootSector[0x2A])<<16 |
+		int64(bootSector[0x2B])<<24 |
+		int64(bootSector[0x2C])<<32 |
+		int64(bootSector[0x2D])<<40 |
+		int64(bootSector[0x2E])<<48 |
+		int64(bootSector[0x2F])<<56
+
+	// MFT Logical Cluster Number (offset 0x30, 8 bytes)
+	vol.mftLCN = int64(bootSector[0x30]) |
+		int64(bootSector[0x31])<<8 |
+		int64(bootSector[0x32])<<16 |
+		int64(bootSector[0x33])<<24 |
+		int64(bootSector[0x34])<<32 |
+		int64(bootSector[0x35])<<40 |
+		int64(bootSector[0x36])<<48 |
+		int64(bootSector[0x37])<<56
+
+	// MFT Mirror Logical Cluster Number (offset 0x38, 8 bytes)
+	vol.mftMirrLCN = int64(bootSector[0x38]) |
+		int64(bootSector[0x39])<<8 |
+		int64(bootSector[0x3A])<<16 |
+		int64(bootSector[0x3B])<<24 |
+		int64(bootSector[0x3C])<<32 |
+		int64(bootSector[0x3D])<<40 |
+		int64(bootSector[0x3E])<<48 |
+		int64(bootSector[0x3F])<<56
+
+	// Clusters per MFT Record (offset 0x40, 1 byte)
+	// If positive (< 0x80), it's the number of clusters per MFT record
+	// If negative (>= 0x80), it's 2^(-1 * val) in bytes
+	clustersPerMFTRecord := int(bootSector[0x40])
+	if clustersPerMFTRecord >= 0x80 {
+		// Negative value - compute actual byte length as 2^(256-n)
+		exponent := 256 - clustersPerMFTRecord
+		vol.mftRecordSize = 1 << uint(exponent)
+	} else {
+		vol.mftRecordSize = clustersPerMFTRecord * vol.bytesPerCluster
+	}
+
+	// Sanity check MFT Record Size
+	if vol.mftRecordSize < 1024 || vol.mftRecordSize > 4096 {
+		// Some default based on common values if invalid
+		vol.mftRecordSize = 1024
+		fmt.Printf("Warning: Invalid MFT record size detected, using default of %d bytes\n", 
+vol.mftRecordSize)
+	}
+
+	// The real MFT offset in bytes from the start of the file
+	vol.mftOffset = vol.bootSectorOffset + vol.mftLCN*int64(vol.bytesPerCluster)
+	vol.mftStart = vol.mftOffset
+
+	fmt.Printf("NTFS Volume Information:\n")
+	fmt.Printf("  Bytes per sector: %d\n", vol.bytesPerSector)
+	fmt.Printf("  Sectors per cluster: %d\n", vol.sectorsPerCluster)
+	fmt.Printf("  Bytes per cluster: %d\n", vol.bytesPerCluster)
+	fmt.Printf("  Total sectors: %d\n", vol.totalSectors)
+	fmt.Printf("  Volume size: %d bytes\n", vol.totalSectors*int64(vol.bytesPerSector))
+	fmt.Printf("  MFT LCN: %d\n", vol.mftLCN)
+	fmt.Printf("  MFT offset: 0x%X\n", vol.mftOffset)
+	fmt.Printf("  MFT Mirror LCN: %d\n", vol.mftMirrLCN)
+	fmt.Printf("  MFT record size: %d bytes\n", vol.mftRecordSize)
+
+	return nil
+}
+
+// readAt reads from the split files at the specified offset
+func (v *NTFSVolume) readAt(data []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("negative offset not allowed")
+	}
+
+	if offset >= v.volumeSize {
+		return 0, fmt.Errorf("offset beyond volume size")
+	}
+
+	// Find which file contains the offset
+	var currentOffset int64
+	for i, file := range v.device {
+		info, err := file.Stat()
+		if err != nil {
+			return 0, fmt.Errorf("failed to get file size for part %d: %v", i+1, err)
+		}
+		fileSize := info.Size()
+
+		if offset < currentOffset+fileSize {
+			// This file contains our data
+			fileOffset := offset - currentOffset
+			return file.ReadAt(data, fileOffset)
+		}
+		currentOffset += fileSize
+	}
+
+	return 0, fmt.Errorf("failed to find file containing offset %d", offset)
+}
+
+// readBootSector reads and parses the NTFS boot sector
+func (v *NTFSVolume) readBootSector() (*BootSector, error) {
+	bootSector := &BootSector{}
+	data := make([]byte, 512)
+
+	n, err := v.readAt(data, v.partitionOffset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read boot sector: %v", err)
+	}
+
+	if n != 512 {
+		return nil, fmt.Errorf("incomplete boot sector read: got %d bytes", n)
+	}
+
+	// Print first 16 bytes for debugging
+	fmt.Printf("Debug: Boot sector first 16 bytes: % X\n", data[:16])
+
+	// Verify NTFS signature
+	if string(data[3:7]) != "NTFS" {
+		return nil, fmt.Errorf("NTFS signature not found")
+	}
+
+	// Parse boot sector fields
+	copy(bootSector.JumpInstruction[:], data[0:3])
+	copy(bootSector.OemID[:], data[3:11])
+
+	bootSector.BytesPerSector = binary.LittleEndian.Uint16(data[0x0B:0x0D])
+	bootSector.SectorsPerCluster = data[0x0D]
+	bootSector.ReservedSectors = binary.LittleEndian.Uint16(data[0x0E:0x10])
+	bootSector.MediaDescriptor = data[0x15]
+	bootSector.SectorsPerTrack = binary.LittleEndian.Uint16(data[0x18:0x1A])
+	bootSector.NumberOfHeads = binary.LittleEndian.Uint16(data[0x1A:0x1C])
+	bootSector.HiddenSectors = binary.LittleEndian.Uint32(data[0x1C:0x20])
+	bootSector.TotalSectors = binary.LittleEndian.Uint64(data[0x28:0x30])
+	bootSector.MftStartLcn = binary.LittleEndian.Uint64(data[0x30:0x38])
+	bootSector.Mft2StartLcn = binary.LittleEndian.Uint64(data[0x38:0x40])
+	bootSector.ClustersPerMftRecord = int8(data[0x40])
+	bootSector.ClustersPerIndexBlock = int8(data[0x44])
+
+	// Print debug info
+	fmt.Printf("Debug: Boot Sector Info:\n")
+	fmt.Printf("- OEM ID: %s\n", string(data[3:11]))
+	fmt.Printf("- Bytes per Sector: %d\n", bootSector.BytesPerSector)
+	fmt.Printf("- Sectors per Cluster: %d\n", bootSector.SectorsPerCluster)
+	fmt.Printf("- MFT Start LCN: %d\n", bootSector.MftStartLcn)
+	fmt.Printf("- Clusters per MFT Record: %d\n", bootSector.ClustersPerMftRecord)
+
+	return bootSector, nil
+}
+
+// Close closes the volume
+func (vol *NTFSVolume) Close() error {
+	if vol.device != nil {
+		return vol.device.Close()
+	}
+	return nil
+}
+
+// ReadBytes reads data from the volume at specified offset and length
+func (vol *NTFSVolume) ReadBytes(offset int64, length int) ([]byte, error) {
+	buffer := make([]byte, length)
+
+	// Calculate the absolute offset including bootSectorOffset
+	absoluteOffset := vol.bootSectorOffset + offset
+
+	n, err := vol.device.ReadAt(buffer, absoluteOffset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("error reading %d bytes at offset %d: %v", length, offset, err)
+	}
+
+	if n < length {
+		return buffer[:n], nil
+	}
+
+	return buffer, nil
+}
+
+// GetMFTRecord reads an MFT record by its ID
+func (vol *NTFSVolume) GetMFTRecord(recordNum int64) ([]byte, error) {
+	if recordNum < 0 || recordNum >= vol.mftRecordCount {
+		return nil, fmt.Errorf("MFT record number out of range: %d", recordNum)
+	}
+
+	// Calculate the offset of the MFT record
+	recordOffset := vol.mftOffset + recordNum*int64(vol.mftRecordSize)
+
+	// Read the MFT record
+	record := make([]byte, vol.mftRecordSize)
+	_, err := vol.device.ReadAt(record, recordOffset)
+	if err != nil {
+		return nil, fmt.Errorf("error reading MFT record %d: %v", recordNum, err)
+	}
+
+	// Check for FILE signature
+	if string(record[0:4]) != "FILE" {
+		return nil, fmt.Errorf("invalid MFT record signature for record %d", recordNum)
+	}
+
+	// Apply USA fixups
+	fixupOffset := int(binary.LittleEndian.Uint16(record[4:6]))
+	fixupCount := int(binary.LittleEndian.Uint16(record[6:8]))
+
+	// Validate fixup values to avoid panics
+	if fixupOffset > 0 && fixupOffset+fixupCount*2 <= vol.mftRecordSize {
+		if fixupCount > 1 {
+			fixupArray := record[fixupOffset : fixupOffset+fixupCount*2]
+			fixupExpected := binary.LittleEndian.Uint16(fixupArray[0:2])
+
+			// Apply fixups to each sector
+			for i := 1; i < fixupCount; i++ {
+				sectorEndOffset := i*vol.bytesPerSector - 2
+				if sectorEndOffset+2 <= vol.mftRecordSize {
+					fixupValue := binary.LittleEndian.Uint16(fixupArray[i*2 : i*2+2])
+
+					// Replace the value
+					binary.LittleEndian.PutUint16(record[sectorEndOffset:sectorEndOffset+2], fixupValue)
+				}
+			}
+		}
+	} else {
+		fmt.Printf("Warning: Invalid USA count (%d) for MFT record %d, skipping fixups\n",
+			fixupCount, recordNum)
+	}
+
+	return record, nil
+}
+
+// ReadFileContent reads the entire content of a file
+func (v *NTFSVolume) ReadFileContent(file *FileInfo) ([]byte, error) {
+	// Find the data attribute
+	var dataAttr *Attribute
+	for i, attr := range file.AttrList {
+		if attr.Type == ATTR_DATA && attr.Name == "" {
+			dataAttr = &file.AttrList[i]
+			break
+		}
+	}
+
+	if dataAttr == nil {
+		return nil, fmt.Errorf("no data attribute found")
+	}
+
+	// For resident data, return the data directly
+	if dataAttr.Resident {
+		return dataAttr.Data, nil
+	}
+
+	// For non-resident data, read the runs
+	dataRuns, err := parseDataRuns(dataAttr.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	// Allocate buffer for the file content
+	content := make([]byte, file.Size)
+	offset := 0
+
+	// Read from each run
+	var currentLCN int64 = 0
+	for i, run := range dataRuns {
+		if i == 0 {
+			currentLCN = run.StartCluster
+		} else {
+			currentLCN += run.StartCluster
+		}
+
+		// Skip sparse runs
+		if !run.IsHole {
+			runSize := int(run.ClusterCount) * int(v.clusterSize)
+			if offset+runSize > len(content) {
+				runSize = len(content) - offset
+			}
+
+			// Read data from this run
+			_, err := v.device[0].ReadAt(content[offset:offset+runSize],
+				v.partitionOffset+currentLCN*int64(v.clusterSize))
+			if err != nil {
+				return nil, err
+			}
+
+			offset += runSize
+		} else {
+			// For sparse runs, fill with zeros
+			runSize := int(run.ClusterCount) * int(v.clusterSize)
+			if offset+runSize > len(content) {
+				runSize = len(content) - offset
+			}
+
+			// Fill with zeros
+			for i := 0; i < runSize; i++ {
+				content[offset+i] = 0
+			}
+
+			offset += runSize
+		}
+	}
+
+	return content, nil
+}
+
+// ReadFileData reads a portion of a file's content
+func (v *NTFSVolume) ReadFileData(file *FileInfo, offset int64, size int) ([]byte, error) {
+	// Get full content (can be optimized to read only the needed portion)
+	content, err := v.ReadFileContent(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the requested portion
+	if offset >= int64(len(content)) {
+		return []byte{}, nil
+	}
+
+	endOffset := offset + int64(size)
+	if endOffset > int64(len(content)) {
+		endOffset = int64(len(content))
+	}
+
+	return content[offset:endOffset], nil
+}
+
+// GetMFTSize returns the size of the MFT in records
+func (v *NTFSVolume) GetMFTSize() int64 {
+	// First attempt: try to read the $MFT file (record 0)
+	mftRecord, err := v.GetMFTRecord(0)
+	if err != nil {
+		fmt.Printf("Warning: Error reading MFT record 0: %v\n", err)
+		// Fall back to a reasonable default
+		return 1000
+	}
+
+	mftFileRecord, err := ParseMFTRecord(mftRecord)
+	if err != nil {
+		fmt.Printf("Warning: Error parsing MFT record 0: %v\n", err)
+		// Fall back to a reasonable default
+		return 1000
+	}
+
+	// Look for the $DATA attribute
+	var dataSize int64
+	for _, attr := range mftFileRecord.Attributes {
+		if attr.Type == ATTR_DATA && (attr.Name == "" || attr.Name == "$DATA") {
+			if attr.Resident {
+				dataSize = int64(len(attr.Data))
+			} else if attr.NonResident != nil {
+				dataSize = int64(attr.NonResident.RealSize)
+			}
+			break
+		}
+	}
+
+	if dataSize == 0 {
+		fmt.Printf("Warning: Could not determine MFT size, using default\n")
+		return 1000
+	}
+
+	// Divide by MFT record size to get the number of records
+	return dataSize / int64(v.mftRecordSize)
+}
+
+// readNonResidentAttribute reads a non-resident attribute from disk
+func (v *NTFSVolume) readNonResidentAttribute(attr *Attribute) ([]byte, error) {
+	if attr == nil {
+		return nil, fmt.Errorf("attribute is nil")
+	}
+
+	if attr.Resident {
+		return attr.Data, nil
+	}
+
+	if attr.NonResident == nil {
+		return nil, fmt.Errorf("attribute is non-resident but NonResident info is nil")
+	}
+
+	// For non-resident attributes, we need to read the data runs
+	runs, err := parseDataRuns(attr.Data)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing data runs: %v", err)
+	}
+
+	// Calculate total size
+	totalSize := attr.NonResident.RealSize
+	result := make([]byte, totalSize)
+
+	// Read each data run
+	var currentLCN int64 = 0
+	var bytesRead int64 = 0
+
+	for i, run := range runs {
+		if bytesRead >= int64(totalSize) {
+			break
+		}
+
+		// Calculate absolute LCN
+		if i == 0 {
+			currentLCN = run.StartCluster
+		} else {
+			currentLCN += run.StartCluster
+		}
+
+		// Skip sparse runs (holes)
+		if run.IsHole {
+			// For sparse runs, just zero out the data
+			toRead := int64(run.ClusterCount) * int64(v.clusterSize)
+			if bytesRead+toRead > int64(totalSize) {
+				toRead = int64(totalSize) - bytesRead
+			}
+			// Zero out the region (already zeroed in the make call)
+			bytesRead += toRead
+			continue
+		}
+
+		// Calculate absolute offset
+		absOffset := v.partitionOffset + currentLCN*int64(v.clusterSize)
+		toRead := int64(run.ClusterCount) * int64(v.clusterSize)
+
+		// Don't read past the end of the attribute
+		if bytesRead+toRead > int64(totalSize) {
+			toRead = int64(totalSize) - bytesRead
+		}
+
+		// Read the data
+		_, err := v.readAt(result[bytesRead:bytesRead+toRead], absOffset)
+		if err != nil {
+			return nil, fmt.Errorf("error reading data run: %v", err)
+		}
+
+		bytesRead += toRead
+	}
+
+	return result, nil
+}
+
+// readMFT reads and processes the Master File Table
+func (vol *NTFSVolume) readMFT() error {
+	// Get File Record for the $MFT (which is always at index 0)
+	mftRecord := make([]byte, vol.mftRecordSize)
+
+	// Read the MFT record from the offset we calculated
+	_, err := vol.device.ReadAt(mftRecord, vol.mftOffset)
+	if err != nil {
+		return fmt.Errorf("error reading MFT record: %v", err)
+	}
+
+	// Verify it has a FILE signature
+	if string(mftRecord[0:4]) != "FILE" {
+		return fmt.Errorf("invalid MFT record signature: expected 'FILE', got '%s'",
+			string(mftRecord[0:4]))
+	}
+
+	// Apply USA fixups
+	fixupOffset := int(binary.LittleEndian.Uint16(mftRecord[4:6]))
+	fixupCount := int(binary.LittleEndian.Uint16(mftRecord[6:8]))
+
+	if fixupCount > 1 {
+		fixupArray := mftRecord[fixupOffset : fixupOffset+fixupCount*2]
+		fixupExpected := binary.LittleEndian.Uint16(fixupArray[0:2])
+
+		// Apply fixups to each sector
+		for i := 1; i < fixupCount; i++ {
+			sectorEndOffset := i*vol.bytesPerSector - 2
+			fixupValue := binary.LittleEndian.Uint16(fixupArray[i*2 : i*2+2])
+
+			// Check if the value matches the expected value
+			if binary.LittleEndian.Uint16(mftRecord[sectorEndOffset:sectorEndOffset+2]) != fixupExpected {
+				fmt.Printf("Warning: USA fixup verification failed for sector %d\n", i)
+			}
+
+			// Replace the value
+			binary.LittleEndian.PutUint16(mftRecord[sectorEndOffset:sectorEndOffset+2], fixupValue)
+		}
+	}
+
+	// TODO: Calculate MFT size by scanning $DATA attribute of $MFT
+	// For now, assume a reasonable number of MFT records
+	vol.mftRecordCount = 100000 // Just an arbitrary large number to scan
+
+	fmt.Printf("MFT Record 0 read successfully\n")
+	fmt.Printf("MFT Record size: %d bytes\n", vol.mftRecordSize)
+	fmt.Printf("Estimated MFT Records: %d\n", vol.mftRecordCount)
+
+	return nil
+}
+
+// ReadSectors reads the specified sectors from the volume
+func (vol *NTFSVolume) ReadSectors(startSector, count int64) ([]byte, error) {
+	buffer := make([]byte, count*int64(vol.bytesPerSector))
+
+	// Calculate absolute offset including boot sector offset
+	offset := vol.bootSectorOffset + startSector*int64(vol.bytesPerSector)
+
+	// Read sectors
+	_, err := vol.device.ReadAt(buffer, offset)
+	if err != nil {
+		return nil, fmt.Errorf("error reading sectors: %v", err)
+	}
+
+	return buffer, nil
+}
+
+// ReadClusters reads the specified clusters from the volume
+func (vol *NTFSVolume) ReadClusters(startCluster, count int64) ([]byte, error) {
+	buffer := make([]byte, count*int64(vol.bytesPerCluster))
+
+	// Calculate absolute offset including boot sector offset
+	offset := vol.bootSectorOffset + startCluster*int64(vol.bytesPerCluster)
+
+	// Read clusters
+	_, err := vol.device.ReadAt(buffer, offset)
+	if err != nil {
+		return nil, fmt.Errorf("error reading clusters: %v", err)
+	}
+
+	return buffer, nil
+}
+
+// GetMFTSize returns the total MFT size
+	return vol.mftRecordCount, nil
+}
+
+// GetMFTRecordUint64 is a compatibility function for code that expects uint64 parameters
+func (vol *NTFSVolume) GetMFTRecordUint64(recordNum uint64) ([]byte, error) {
+	return vol.GetMFTRecord(int64(recordNum))
+}
+
+// FindNTFSBootSector scans the image file to locate the NTFS boot sector
+// by looking for the "NTFS    " signature at offset 3
+func (v *NTFSVolume) FindNTFSBootSector() (int64, error) {
+	// Start by checking common offsets: 0 (raw NTFS volume) and 63/64 (MBR+partition)
+	commonOffsets := []int64{0, 63, 64, 128, 2048}
+
+	// Create a buffer for reading sectors
+	buffer := make([]byte, 512)
+
+	// First check common offsets for efficiency
+	for _, offset := range commonOffsets {
+		sectorOffset := offset * 512
+		_, err := v.device.ReadAt(buffer, sectorOffset)
+		if err != nil {
+			continue
+		}
+
+		// Check for NTFS signature at offset 3
+		if buffer[3] == 'N' && buffer[4] == 'T' && buffer[5] == 'F' && buffer[6] == 'S' {
+			v.bootSectorOffset = sectorOffset
+			fmt.Printf("NTFS boot sector found at sector %d (offset 0x%X)\n", offset, sectorOffset)
+			return sectorOffset, nil
+		}
+	}
+
+	// If not found in common offsets, look for MBR and parse partition table
+	_, err := v.device.ReadAt(buffer, 0)
+	if err == nil && buffer[510] == 0x55 && buffer[511] == 0xAA {
+		// MBR found, parse partition table
+		for i := 0; i < 4; i++ {
+			pOffset := 446 + i*16
+			pType := buffer[pOffset+4]
+
+			// Check if it's an NTFS partition (type 0x07)
+			if pType == 0x07 {
+				// Get the starting LBA
+				startLBA := int64(buffer[pOffset+8]) |
+					int64(buffer[pOffset+9])<<8 |
+					int64(buffer[pOffset+10])<<16 |
+					int64(buffer[pOffset+11])<<24
+
+				// Check if this sector has an NTFS boot sector
+				sectorOffset := startLBA * 512
+				_, err := v.device.ReadAt(buffer, sectorOffset)
+				if err == nil && buffer[3] == 'N' && buffer[4] == 'T' && buffer[5] == 'F' && buffer[6] == 'S' {
+					v.bootSectorOffset = sectorOffset
+					fmt.Printf("NTFS boot sector found at sector %d (offset 0x%X) via MBR\n", startLBA, sectorOffset)
+					return sectorOffset, nil
+				}
+			}
+		}
+	}
+
+	// If still not found, scan a larger range
+	fmt.Println("NTFS boot sector not found in common locations, performing more extensive search...")
+	maxSectors := int64(4096) // Limit search to first 4096 sectors (2MB)
+
+	for offset := int64(0); offset < maxSectors; offset++ {
+		sectorOffset := offset * 512
+		_, err := v.device.ReadAt(buffer, sectorOffset)
+		if err != nil {
+			break
+		}
+
+		// Check for NTFS signature
+		if buffer[3] == 'N' && buffer[4] == 'T' && buffer[5] == 'F' && buffer[6] == 'S' {
+			v.bootSectorOffset = sectorOffset
+			fmt.Printf("NTFS boot sector found at sector %d (offset 0x%X) during scan\n", offset, sectorOffset)
+			return sectorOffset, nil
+		}
+	}
+
+	return 0, fmt.Errorf("NTFS boot sector not found in first %d sectors", maxSectors)
+}
+
+// UpdateVolumeInfoFromBootSector reads NTFS volume parameters from the boot sector
+func (v *NTFSVolume) UpdateVolumeInfoFromBootSector(bootSectorOffset int64) error {
+	// Read the boot sector
+	bootSector := make([]byte, 512)
+	_, err := v.device.ReadAt(bootSector, bootSectorOffset)
+	if err != nil {
+		return fmt.Errorf("error reading boot sector: %v", err)
+	}
+
+	// Verify NTFS signature
+	if bootSector[3] != 'N' || bootSector[4] != 'T' || bootSector[5] != 'F' || bootSector[6] != 'S' {
+		return fmt.Errorf("invalid NTFS signature in boot sector")
+	}
+
+	// Parse boot sector fields
+	v.bytesPerSector = binary.LittleEndian.Uint16(bootSector[11:13])
+	v.sectorsPerCluster = bootSector[13]
+	v.hiddenSectors = binary.LittleEndian.Uint32(bootSector[28:32])
+	v.totalSectors = binary.LittleEndian.Uint64(bootSector[40:48])
+	v.mftStartLCN = binary.LittleEndian.Uint64(bootSector[48:56])
+	v.mftMirrStartLCN = binary.LittleEndian.Uint64(bootSector[56:64])
+
+	// Calculate derived values
+	v.bytesPerCluster = uint32(v.bytesPerSector) * uint32(v.sectorsPerCluster)
+	v.clusterCount = uint64(v.totalSectors) / uint64(v.sectorsPerCluster)
+	v.mftStartOffset = bootSectorOffset + int64(v.mftStartLCN)*int64(v.bytesPerCluster)
+
+	// Calculate MFT record size
+	clustersPerMFTRecord := bootSector[64]
+	if clustersPerMFTRecord&0x80 != 0 {
+		// Negative value (expressed as 2^(256-N) bytes)
+		v.mftRecordSize = 1 << (256 - uint8(clustersPerMFTRecord))
+	} else {
+		// Positive value (expressed as N clusters)
+		v.mftRecordSize = uint32(clustersPerMFTRecord) * v.bytesPerCluster
+	}
+
+	// For backward compatibility, also set these fields
+	v.sectorSize = uint32(v.bytesPerSector)
+	v.clusterSize = uint32(v.bytesPerCluster)
+	v.mftStart = v.mftStartLCN
+
+	return nil
+}
+
+// OpenVolume opens and initializes an NTFS volume, automatically detecting the boot sector
+func OpenVolume(devicePath string) (*NTFSVolume, error) {
+	volume := &NTFSVolume{
+		devicePath: devicePath,
+	}
+
+	// Open the volume file
+	file, err := os.Open(devicePath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening volume: %v", err)
+	}
+	volume.device = file
+
+	// Find the NTFS boot sector
+	bootSectorOffset, err := volume.FindNTFSBootSector()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// Update volume information from the boot sector
+	err = volume.UpdateVolumeInfoFromBootSector(bootSectorOffset)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// Log volume information for debugging
+	fmt.Printf("Volume information from boot sector:\n")
+	fmt.Printf("  Bytes per sector: %d\n", volume.bytesPerSector)
+	fmt.Printf("  Sectors per cluster: %d\n", volume.sectorsPerCluster)
+	fmt.Printf("  Bytes per cluster: %d\n", volume.bytesPerCluster)
+	fmt.Printf("  Total sectors: %d\n", volume.totalSectors)
+	fmt.Printf("  MFT start LCN: %d\n", volume.mftStartLCN)
+	fmt.Printf("  MFT start offset: 0x%X\n", volume.mftStartOffset)
+	fmt.Printf("  MFT record size: %d bytes\n", volume.mftRecordSize)
+
+	// Read MFT
+	if err := volume.readMFT(); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("error reading MFT: %v", err)
+	}
+
+	return volume, nil
+}
+
+
+package ntfs
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+)
+
+// Partition entry structure
+type PartitionEntry struct {
+	Status        byte
+	StartCHS      [3]byte
+	PartitionType byte
+	EndCHS        [3]byte
+	StartLBA      uint32
+	SectorCount   uint32
+}
+
+// NTFSVolume represents an NTFS volume
+type NTFSVolume struct {
+	devicePath        string      // Path to the volume device
+	device            *os.File    // File handle for the volume
+	bootSectorOffset  int64       // Offset to NTFS boot sector
+	bytesPerSector    int         // Bytes per sector
+	sectorsPerCluster int         // Sectors per cluster
+	bytesPerCluster   int         // Bytes per cluster
+	clusterSize       int         // Same as bytesPerCluster (for backwards compatibility)
+	totalSectors      int64       // Total sectors in volume
+	mftOffset         int64       // Offset to MFT in bytes from start of file
+	mftStart          int64       // Same as mftOffset (for backwards compatibility)
+	mftLCN            int64       // Logical Cluster Number of MFT start
+	mftMirrLCN        int64       // Logical Cluster Number of MFT mirror
+	mftRecordSize     int         // Size of each MFT record in bytes
+	sectorSize        int         // Same as bytesPerSector (for backwards compatibility)
+	volumeSize        int64       // Total size of the volume in bytes
+	bootSector        *BootSector // NTFS boot sector
+	partitionOffset   int64       // Offset to the start of the partition
+	partitionType     byte        // Partition type
+	mftRecordCount    int64       // Number of MFT records
+}
+
+// BootSector represents the NTFS boot sector
+type BootSector struct {
+	JumpInstruction       [3]byte
+	OemID                 [8]byte
+	BytesPerSector        uint16
+	SectorsPerCluster     uint8
+	ReservedSectors       uint16
+	MediaDescriptor       uint8
+	SectorsPerTrack       uint16
+	NumberOfHeads         uint16
+	HiddenSectors         uint32
+	TotalSectors          uint64
+	MftStartLcn           uint64
+	Mft2StartLcn          uint64
+	ClustersPerMftRecord  int8
+	ClustersPerIndexBlock int8
+}
+
+// NewNTFSVolume creates a new NTFSVolume instance from the provided device path.
+func NewNTFSVolume(path string) (*NTFSVolume, error) {
+	// Use the new OpenVolume function which handles boot sector detection
+	return OpenVolume(path)
+}
+
+// findNTFSBootSector attempts to locate the NTFS boot sector in the device
+// It first checks the beginning of the device, and if no valid NTFS signature is found,
+// it searches in common partition offsets
+func findNTFSBootSector(file *os.File) ([]byte, int64, error) {
+	// Common offsets where NTFS partitions might start (in sectors)
+	// 0 = start of device
+	// 63, 64, 2048 = common partition offsets
+	commonOffsets := []int64{0, 63, 64, 2048}
+	sectorSize := int64(512)
+
+	// First check MBR to see if we can find NTFS partitions
+	mbr := make([]byte, sectorSize)
+	_, err := file.ReadAt(mbr, 0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error reading MBR: %v", err)
+	}
+
+	// Check for MBR signature (0x55, 0xAA at offset 0x1FE)
+	if mbr[0x1FE] == 0x55 && mbr[0x1FF] == 0xAA {
+		fmt.Println("Found valid MBR signature")
+
+		// Parse partition table entries
+		for i := 0; i < 4; i++ {
+			entryOffset := 0x1BE + i*16
+			// Status byte is not used in our code, so not assigning it to avoid linter warning
+			// status := mbr[entryOffset]
+			partType := mbr[entryOffset+4]
+
+			// Check if NTFS partition (type 0x07)
+			if partType == 0x07 {
+				// Extract starting sector (LBA)
+				startLBA := int64(mbr[entryOffset+8]) |
+					int64(mbr[entryOffset+9])<<8 |
+					int64(mbr[entryOffset+10])<<16 |
+					int64(mbr[entryOffset+11])<<24
+
+				fmt.Printf("Found NTFS partition at sector %d (offset 0x%X)\n",
+					startLBA, startLBA*sectorSize)
+
+				// Add this offset to our common offsets to check
+				commonOffsets = append([]int64{startLBA}, commonOffsets...)
+			}
+		}
+	}
+
+	// Check each potential offset for NTFS signature
+	bootSector := make([]byte, sectorSize)
+	for _, offsetInSectors := range commonOffsets {
+		offset := offsetInSectors * sectorSize
+
+		// Reset file position
+		_, err := file.Seek(offset, 0)
+		if err != nil {
+			continue
+		}
+
+		// Read potential boot sector
+		_, err = file.ReadAt(bootSector, offset)
+		if err != nil {
+			continue
+		}
+
+		// Check for NTFS signature: "NTFS    " starting at offset 3
+		if bootSector[3] == 'N' &&
+			bootSector[4] == 'T' &&
+			bootSector[5] == 'F' &&
+			bootSector[6] == 'S' &&
+			bootSector[7] == ' ' &&
+			bootSector[8] == ' ' &&
+			bootSector[9] == ' ' &&
+			bootSector[10] == ' ' {
+			fmt.Printf("Found NTFS signature at offset 0x%X\n", offset)
+			return bootSector, offset, nil
+		}
+	}
+
+	return nil, 0, fmt.Errorf("no valid NTFS boot sector found")
+}
+
+// parseBootSector parses the NTFS boot sector and sets volume parameters.
+func (vol *NTFSVolume) parseBootSector(bootSector []byte) error {
+	// Bytes per sector (offset 0x0B, 2 bytes)
+	vol.bytesPerSector = int(bootSector[0x0B]) | int(bootSector[0x0C])<<8
+	if vol.bytesPerSector < 512 || vol.bytesPerSector > 4096 {
+		return fmt.Errorf("invalid bytes per sector: %d", vol.bytesPerSector)
+	}
+
+	// Sectors per cluster (offset 0x0D, 1 byte)
+	vol.sectorsPerCluster = int(bootSector[0x0D])
+	// Check if valid (must be power of 2 from 1 to one 128)
+	switch vol.sectorsPerCluster {
+	case 1, 2, 4, 8, 16, 32, 64, 128:
+		// Valid
+	default:
+		if bootSector[0x0D] >= 240 && bootSector[0x0D] <= 255 {
+			// Negative exponent in sectors per cluster
+			// E.g. 0xF6 means 2^(256-0xF6) = 2^10 = 1024 bytes
+			// This is used for very large (>2TB) volumes
+			exponent := 256 - int(bootSector[0x0D])
+			if exponent <= 7 { // 2^7 = 128 is the max valid value
+				vol.sectorsPerCluster = 1 << exponent
+			} else {
+				return fmt.Errorf("invalid sectors per cluster: %d (decoded from 0x%X)",
+					1<<exponent, bootSector[0x0D])
+			}
+		} else {
+			return fmt.Errorf("invalid sectors per cluster: %d", vol.sectorsPerCluster)
+		}
+	}
+
+	vol.bytesPerCluster = vol.bytesPerSector * vol.sectorsPerCluster
+
+	// Set compatibility fields
+	vol.clusterSize = vol.bytesPerCluster
+	vol.sectorSize = vol.bytesPerSector
+	vol.partitionOffset = vol.bootSectorOffset
+
+	// Total sectors (offset 0x28, 8 bytes)
+	vol.totalSectors = int64(bootSector[0x28]) |
+		int64(bootSector[0x29])<<8 |
+		int64(bootSector[0x2A])<<16 |
+		int64(bootSector[0x2B])<<24 |
+		int64(bootSector[0x2C])<<32 |
+		int64(bootSector[0x2D])<<40 |
+		int64(bootSector[0x2E])<<48 |
+		int64(bootSector[0x2F])<<56
+
+	// MFT Logical Cluster Number (offset 0x30, 8 bytes)
+	vol.mftLCN = int64(bootSector[0x30]) |
+		int64(bootSector[0x31])<<8 |
+		int64(bootSector[0x32])<<16 |
+		int64(bootSector[0x33])<<24 |
+		int64(bootSector[0x34])<<32 |
+		int64(bootSector[0x35])<<40 |
+		int64(bootSector[0x36])<<48 |
+		int64(bootSector[0x37])<<56
+
+	// MFT Mirror Logical Cluster Number (offset 0x38, 8 bytes)
+	vol.mftMirrLCN = int64(bootSector[0x38]) |
+		int64(bootSector[0x39])<<8 |
+		int64(bootSector[0x3A])<<16 |
+		int64(bootSector[0x3B])<<24 |
+		int64(bootSector[0x3C])<<32 |
+		int64(bootSector[0x3D])<<40 |
+		int64(bootSector[0x3E])<<48 |
+		int64(bootSector[0x3F])<<56
+
+	// Clusters per MFT Record (offset 0x40, 1 byte)
+	// If positive (< 0x80), it's the number of clusters per MFT record
+	// If negative (>= 0x80), it's 2^(-1 * val) in bytes
+	clustersPerMFTRecord := int(bootSector[0x40])
+	if clustersPerMFTRecord >= 0x80 {
+		// Negative value - compute actual byte length as 2^(256-n)
+		exponent := 256 - clustersPerMFTRecord
+		vol.mftRecordSize = 1 << uint(exponent)
+	} else {
+		vol.mftRecordSize = clustersPerMFTRecord * vol.bytesPerCluster
+	}
+
+	// Sanity check MFT Record Size
+	if vol.mftRecordSize < 1024 || vol.mftRecordSize > 4096 {
+		// Some default based on common values if invalid
+		vol.mftRecordSize = 1024
+		fmt.Printf("Warning: Invalid MFT record size detected, using default of %d bytes\n", vol.mftRecordSize)
+	}
+
+	// The real MFT offset in bytes from the start of the file
+	vol.mftOffset = vol.bootSectorOffset + vol.mftLCN*int64(vol.bytesPerCluster)
+	vol.mftStart = vol.mftOffset
+
+	fmt.Printf("NTFS Volume Information:\n")
+	fmt.Printf("  Bytes per sector: %d\n", vol.bytesPerSector)
+	fmt.Printf("  Sectors per cluster: %d\n", vol.sectorsPerCluster)
+	fmt.Printf("  Bytes per cluster: %d\n", vol.bytesPerCluster)
+	fmt.Printf("  Total sectors: %d\n", vol.totalSectors)
+	fmt.Printf("  Volume size: %d bytes\n", vol.totalSectors*int64(vol.bytesPerSector))
+	fmt.Printf("  MFT LCN: %d\n", vol.mftLCN)
+	fmt.Printf("  MFT offset: 0x%X\n", vol.mftOffset)
+	fmt.Printf("  MFT Mirror LCN: %d\n", vol.mftMirrLCN)
+	fmt.Printf("  MFT record size: %d bytes\n", vol.mftRecordSize)
+
+	return nil
+}
+
+// readAt reads from the split files at the specified offset
+func (v *NTFSVolume) readAt(data []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("negative offset not allowed")
+	}
+
+	if offset >= v.volumeSize {
+		return 0, fmt.Errorf("offset beyond volume size")
+	}
+
+	// Find which file contains the offset
+	var currentOffset int64
+	for i, file := range v.device {
+		info, err := file.Stat()
+		if err != nil {
+			return 0, fmt.Errorf("failed to get file size for part %d: %v", i+1, err)
+		}
+		fileSize := info.Size()
+
+		if offset < currentOffset+fileSize {
+			// This file contains our data
+			fileOffset := offset - currentOffset
+			return file.ReadAt(data, fileOffset)
+		}
+		currentOffset += fileSize
+	}
+
+	return 0, fmt.Errorf("failed to find file containing offset %d", offset)
+}
+
+// readBootSector reads and parses the NTFS boot sector
+func (v *NTFSVolume) readBootSector() (*BootSector, error) {
+	bootSector := &BootSector{}
+	data := make([]byte, 512)
+
+	n, err := v.readAt(data, v.partitionOffset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read boot sector: %v", err)
+	}
+
+	if n != 512 {
+		return nil, fmt.Errorf("incomplete boot sector read: got %d bytes", n)
+	}
+
+	// Print first 16 bytes for debugging
+	fmt.Printf("Debug: Boot sector first 16 bytes: % X\n", data[:16])
+
+	// Verify NTFS signature
+	if string(data[3:7]) != "NTFS" {
+		return nil, fmt.Errorf("NTFS signature not found")
+	}
+
+	// Parse boot sector fields
+	copy(bootSector.JumpInstruction[:], data[0:3])
+	copy(bootSector.OemID[:], data[3:11])
+
+	bootSector.BytesPerSector = binary.LittleEndian.Uint16(data[0x0B:0x0D])
+	bootSector.SectorsPerCluster = data[0x0D]
+	bootSector.ReservedSectors = binary.LittleEndian.Uint16(data[0x0E:0x10])
+	bootSector.MediaDescriptor = data[0x15]
+	bootSector.SectorsPerTrack = binary.LittleEndian.Uint16(data[0x18:0x1A])
+	bootSector.NumberOfHeads = binary.LittleEndian.Uint16(data[0x1A:0x1C])
+	bootSector.HiddenSectors = binary.LittleEndian.Uint32(data[0x1C:0x20])
+	bootSector.TotalSectors = binary.LittleEndian.Uint64(data[0x28:0x30])
+	bootSector.MftStartLcn = binary.LittleEndian.Uint64(data[0x30:0x38])
+	bootSector.Mft2StartLcn = binary.LittleEndian.Uint64(data[0x38:0x40])
+	bootSector.ClustersPerMftRecord = int8(data[0x40])
+	bootSector.ClustersPerIndexBlock = int8(data[0x44])
+
+	// Print debug info
+	fmt.Printf("Debug: Boot Sector Info:\n")
+	fmt.Printf("- OEM ID: %s\n", string(data[3:11]))
+	fmt.Printf("- Bytes per Sector: %d\n", bootSector.BytesPerSector)
+	fmt.Printf("- Sectors per Cluster: %d\n", bootSector.SectorsPerCluster)
+	fmt.Printf("- MFT Start LCN: %d\n", bootSector.MftStartLcn)
+	fmt.Printf("- Clusters per MFT Record: %d\n", bootSector.ClustersPerMftRecord)
+
+	return bootSector, nil
+}
+
+// Close closes the volume
+func (vol *NTFSVolume) Close() error {
+	if vol.device != nil {
+		return vol.device.Close()
+	}
+	return nil
+}
+
+// ReadBytes reads data from the volume at specified offset and length
+func (vol *NTFSVolume) ReadBytes(offset int64, length int) ([]byte, error) {
+	buffer := make([]byte, length)
+
+	// Calculate the absolute offset including bootSectorOffset
+	absoluteOffset := vol.bootSectorOffset + offset
+
+	n, err := vol.device.ReadAt(buffer, absoluteOffset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("error reading %d bytes at offset %d: %v", length, offset, err)
+	}
+
+	if n < length {
+		return buffer[:n], nil
+	}
+
+	return buffer, nil
+}
+
+// GetMFTRecord reads an MFT record by its ID
+func (vol *NTFSVolume) GetMFTRecord(recordNum int64) ([]byte, error) {
+	if recordNum < 0 || recordNum >= vol.mftRecordCount {
+		return nil, fmt.Errorf("MFT record number out of range: %d", recordNum)
+	}
+
+	// Calculate the offset of the MFT record
+	recordOffset := vol.mftOffset + recordNum*int64(vol.mftRecordSize)
+
+	// Read the MFT record
+	record := make([]byte, vol.mftRecordSize)
+	_, err := vol.device.ReadAt(record, recordOffset)
+	if err != nil {
+		return nil, fmt.Errorf("error reading MFT record %d: %v", recordNum, err)
+	}
+
+	// Check for FILE signature
+	if string(record[0:4]) != "FILE" {
+		return nil, fmt.Errorf("invalid MFT record signature for record %d", recordNum)
+	}
+
+	// Apply USA fixups
+	fixupOffset := int(binary.LittleEndian.Uint16(record[4:6]))
+	fixupCount := int(binary.LittleEndian.Uint16(record[6:8]))
+
+	// Validate fixup values to avoid panics
+	if fixupOffset > 0 && fixupOffset+fixupCount*2 <= vol.mftRecordSize {
+		if fixupCount > 1 {
+			fixupArray := record[fixupOffset : fixupOffset+fixupCount*2]
+			fixupExpected := binary.LittleEndian.Uint16(fixupArray[0:2])
+
+			// Apply fixups to each sector
+			for i := 1; i < fixupCount; i++ {
+				sectorEndOffset := i*vol.bytesPerSector - 2
+				if sectorEndOffset+2 <= vol.mftRecordSize {
+					fixupValue := binary.LittleEndian.Uint16(fixupArray[i*2 : i*2+2])
+
+					// Replace the value
+					binary.LittleEndian.PutUint16(record[sectorEndOffset:sectorEndOffset+2], fixupValue)
+				}
+			}
+		}
+	} else {
+		fmt.Printf("Warning: Invalid USA count (%d) for MFT record %d, skipping fixups\n",
+			fixupCount, recordNum)
+	}
+
+	return record, nil
+}
+
+// ReadFileContent reads the entire content of a file
+func (v *NTFSVolume) ReadFileContent(file *FileInfo) ([]byte, error) {
+	// Find the data attribute
+	var dataAttr *Attribute
+	for i, attr := range file.AttrList {
+		if attr.Type == ATTR_DATA && attr.Name == "" {
+			dataAttr = &file.AttrList[i]
+			break
+		}
+	}
+
+	if dataAttr == nil {
+		return nil, fmt.Errorf("no data attribute found")
+	}
+
+	// For resident data, return the data directly
+	if dataAttr.Resident {
+		return dataAttr.Data, nil
+	}
+
+	// For non-resident data, read the runs
+	dataRuns, err := parseDataRuns(dataAttr.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	// Allocate buffer for the file content
+	content := make([]byte, file.Size)
+	offset := 0
+
+	// Read from each run
+	var currentLCN int64 = 0
+	for i, run := range dataRuns {
+		if i == 0 {
+			currentLCN = run.StartCluster
+		} else {
+			currentLCN += run.StartCluster
+		}
+
+		// Skip sparse runs
+		if !run.IsHole {
+			runSize := int(run.ClusterCount) * int(v.clusterSize)
+			if offset+runSize > len(content) {
+				runSize = len(content) - offset
+			}
+
+			// Read data from this run
+			_, err := v.device[0].ReadAt(content[offset:offset+runSize],
+				v.partitionOffset+currentLCN*int64(v.clusterSize))
+			if err != nil {
+				return nil, err
+			}
+
+			offset += runSize
+		} else {
+			// For sparse runs, fill with zeros
+			runSize := int(run.ClusterCount) * int(v.clusterSize)
+			if offset+runSize > len(content) {
+				runSize = len(content) - offset
+			}
+
+			// Fill with zeros
+			for i := 0; i < runSize; i++ {
+				content[offset+i] = 0
+			}
+
+			offset += runSize
+		}
+	}
+
+	return content, nil
+}
+
+// ReadFileData reads a portion of a file's content
+func (v *NTFSVolume) ReadFileData(file *FileInfo, offset int64, size int) ([]byte, error) {
+	// Get full content (can be optimized to read only the needed portion)
+	content, err := v.ReadFileContent(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the requested portion
+	if offset >= int64(len(content)) {
+		return []byte{}, nil
+	}
+
+	endOffset := offset + int64(size)
+	if endOffset > int64(len(content)) {
+		endOffset = int64(len(content))
+	}
+
+	return content[offset:endOffset], nil
+}
+
+// GetMFTSize returns the size of the MFT in records
+func (v *NTFSVolume) GetMFTSize() int64 {
+	// First attempt: try to read the $MFT file (record 0)
+	mftRecord, err := v.GetMFTRecord(0)
+	if err != nil {
+		fmt.Printf("Warning: Error reading MFT record 0: %v\n", err)
+		// Fall back to a reasonable default
+		return 1000
+	}
+
+	mftFileRecord, err := ParseMFTRecord(mftRecord)
+	if err != nil {
+		fmt.Printf("Warning: Error parsing MFT record 0: %v\n", err)
+		// Fall back to a reasonable default
+		return 1000
+	}
+
+	// Look for the $DATA attribute
+	var dataSize int64
+	for _, attr := range mftFileRecord.Attributes {
+		if attr.Type == ATTR_DATA && (attr.Name == "" || attr.Name == "$DATA") {
+			if attr.Resident {
+				dataSize = int64(len(attr.Data))
+			} else if attr.NonResident != nil {
+				dataSize = int64(attr.NonResident.RealSize)
+			}
+			break
+		}
+	}
+
+	if dataSize == 0 {
+		fmt.Printf("Warning: Could not determine MFT size, using default\n")
+		return 1000
+	}
+
+	// Divide by MFT record size to get the number of records
+	return dataSize / int64(v.mftRecordSize)
+}
+
+// readNonResidentAttribute reads a non-resident attribute from disk
+func (v *NTFSVolume) readNonResidentAttribute(attr *Attribute) ([]byte, error) {
+	if attr == nil {
+		return nil, fmt.Errorf("attribute is nil")
+	}
+
+	if attr.Resident {
+		return attr.Data, nil
+	}
+
+	if attr.NonResident == nil {
+		return nil, fmt.Errorf("attribute is non-resident but NonResident info is nil")
+	}
+
+	// For non-resident attributes, we need to read the data runs
+	runs, err := parseDataRuns(attr.Data)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing data runs: %v", err)
+	}
+
+	// Calculate total size
+	totalSize := attr.NonResident.RealSize
+	result := make([]byte, totalSize)
+
+	// Read each data run
+	var currentLCN int64 = 0
+	var bytesRead int64 = 0
+
+	for i, run := range runs {
+		if bytesRead >= int64(totalSize) {
+			break
+		}
+
+		// Calculate absolute LCN
+		if i == 0 {
+			currentLCN = run.StartCluster
+		} else {
+			currentLCN += run.StartCluster
+		}
+
+		// Skip sparse runs (holes)
+		if run.IsHole {
+			// For sparse runs, just zero out the data
+			toRead := int64(run.ClusterCount) * int64(v.clusterSize)
+			if bytesRead+toRead > int64(totalSize) {
+				toRead = int64(totalSize) - bytesRead
+			}
+			// Zero out the region (already zeroed in the make call)
+			bytesRead += toRead
+			continue
+		}
+
+		// Calculate absolute offset
+		absOffset := v.partitionOffset + currentLCN*int64(v.clusterSize)
+		toRead := int64(run.ClusterCount) * int64(v.clusterSize)
+
+		// Don't read past the end of the attribute
+		if bytesRead+toRead > int64(totalSize) {
+			toRead = int64(totalSize) - bytesRead
+		}
+
+		// Read the data
+		_, err := v.readAt(result[bytesRead:bytesRead+toRead], absOffset)
+		if err != nil {
+			return nil, fmt.Errorf("error reading data run: %v", err)
+		}
+
+		bytesRead += toRead
+	}
+
+	return result, nil
+}
+
+// readMFT reads and processes the Master File Table
+func (vol *NTFSVolume) readMFT() error {
+	// Get File Record for the $MFT (which is always at index 0)
+	mftRecord := make([]byte, vol.mftRecordSize)
+
+	// Read the MFT record from the offset we calculated
+	_, err := vol.device.ReadAt(mftRecord, vol.mftOffset)
+	if err != nil {
+		return fmt.Errorf("error reading MFT record: %v", err)
+	}
+
+	// Verify it has a FILE signature
+	if string(mftRecord[0:4]) != "FILE" {
+		return fmt.Errorf("invalid MFT record signature: expected 'FILE', got '%s'",
+			string(mftRecord[0:4]))
+	}
+
+	// Apply USA fixups
+	fixupOffset := int(binary.LittleEndian.Uint16(mftRecord[4:6]))
+	fixupCount := int(binary.LittleEndian.Uint16(mftRecord[6:8]))
+
+	if fixupCount > 1 {
+		fixupArray := mftRecord[fixupOffset : fixupOffset+fixupCount*2]
+		fixupExpected := binary.LittleEndian.Uint16(fixupArray[0:2])
+
+		// Apply fixups to each sector
+		for i := 1; i < fixupCount; i++ {
+			sectorEndOffset := i*vol.bytesPerSector - 2
+			fixupValue := binary.LittleEndian.Uint16(fixupArray[i*2 : i*2+2])
+
+			// Check if the value matches the expected value
+			if binary.LittleEndian.Uint16(mftRecord[sectorEndOffset:sectorEndOffset+2]) != fixupExpected {
+				fmt.Printf("Warning: USA fixup verification failed for sector %d\n", i)
+			}
+
+			// Replace the value
+			binary.LittleEndian.PutUint16(mftRecord[sectorEndOffset:sectorEndOffset+2], fixupValue)
+		}
+	}
+
+	// TODO: Calculate MFT size by scanning $DATA attribute of $MFT
+	// For now, assume a reasonable number of MFT records
+	vol.mftRecordCount = 100000 // Just an arbitrary large number to scan
+
+	fmt.Printf("MFT Record 0 read successfully\n")
+	fmt.Printf("MFT Record size: %d bytes\n", vol.mftRecordSize)
+	fmt.Printf("Estimated MFT Records: %d\n", vol.mftRecordCount)
+
+	return nil
+}
+
+// ReadSectors reads the specified sectors from the volume
+func (vol *NTFSVolume) ReadSectors(startSector, count int64) ([]byte, error) {
+	buffer := make([]byte, count*int64(vol.bytesPerSector))
+
+	// Calculate absolute offset including boot sector offset
+	offset := vol.bootSectorOffset + startSector*int64(vol.bytesPerSector)
+
+	// Read sectors
+	_, err := vol.device.ReadAt(buffer, offset)
+	if err != nil {
+		return nil, fmt.Errorf("error reading sectors: %v", err)
+	}
+
+	return buffer, nil
+}
+
+// ReadClusters reads the specified clusters from the volume
+func (vol *NTFSVolume) ReadClusters(startCluster, count int64) ([]byte, error) {
+	buffer := make([]byte, count*int64(vol.bytesPerCluster))
+
+	// Calculate absolute offset including boot sector offset
+	offset := vol.bootSectorOffset + startCluster*int64(vol.bytesPerCluster)
+
+	// Read clusters
+	_, err := vol.device.ReadAt(buffer, offset)
+	if err != nil {
+		return nil, fmt.Errorf("error reading clusters: %v", err)
+	}
+
+	return buffer, nil
+}
+
+}
+
+// GetMFTRecordUint64 is a compatibility function for code that expects uint64 parameters
+func (vol *NTFSVolume) GetMFTRecordUint64(recordNum uint64) ([]byte, error) {
+	return vol.GetMFTRecord(int64(recordNum))
+}
+
+// FindNTFSBootSector scans the image file to locate the NTFS boot sector
+// by looking for the "NTFS    " signature at offset 3
+func (v *NTFSVolume) FindNTFSBootSector() (int64, error) {
+	// Start by checking common offsets: 0 (raw NTFS volume) and 63/64 (MBR+partition)
+	commonOffsets := []int64{0, 63, 64, 128, 2048}
+
+	// Create a buffer for reading sectors
+	buffer := make([]byte, 512)
+
+	// First check common offsets for efficiency
+	for _, offset := range commonOffsets {
+		sectorOffset := offset * 512
+		_, err := v.device.ReadAt(buffer, sectorOffset)
+		if err != nil {
+			continue
+		}
+
+		// Check for NTFS signature at offset 3
+		if buffer[3] == 'N' && buffer[4] == 'T' && buffer[5] == 'F' && buffer[6] == 'S' {
+			v.bootSectorOffset = sectorOffset
+			fmt.Printf("NTFS boot sector found at sector %d (offset 0x%X)\n", offset, sectorOffset)
+			return sectorOffset, nil
+		}
+	}
+
+	// If not found in common offsets, look for MBR and parse partition table
+	_, err := v.device.ReadAt(buffer, 0)
+	if err == nil && buffer[510] == 0x55 && buffer[511] == 0xAA {
+		// MBR found, parse partition table
+		for i := 0; i < 4; i++ {
+			pOffset := 446 + i*16
+			pType := buffer[pOffset+4]
+
+			// Check if it's an NTFS partition (type 0x07)
+			if pType == 0x07 {
+				// Get the starting LBA
+				startLBA := int64(buffer[pOffset+8]) |
+					int64(buffer[pOffset+9])<<8 |
+					int64(buffer[pOffset+10])<<16 |
+					int64(buffer[pOffset+11])<<24
+
+				// Check if this sector has an NTFS boot sector
+				sectorOffset := startLBA * 512
+				_, err := v.device.ReadAt(buffer, sectorOffset)
+				if err == nil && buffer[3] == 'N' && buffer[4] == 'T' && buffer[5] == 'F' && buffer[6] == 'S' {
+					v.bootSectorOffset = sectorOffset
+					fmt.Printf("NTFS boot sector found at sector %d (offset 0x%X) via MBR\n", startLBA, sectorOffset)
+					return sectorOffset, nil
+				}
+			}
+		}
+	}
+
+	// If still not found, scan a larger range
+	fmt.Println("NTFS boot sector not found in common locations, performing more extensive search...")
+	maxSectors := int64(4096) // Limit search to first 4096 sectors (2MB)
+
+	for offset := int64(0); offset < maxSectors; offset++ {
+		sectorOffset := offset * 512
+		_, err := v.device.ReadAt(buffer, sectorOffset)
+		if err != nil {
+			break
+		}
+
+		// Check for NTFS signature
+		if buffer[3] == 'N' && buffer[4] == 'T' && buffer[5] == 'F' && buffer[6] == 'S' {
+			v.bootSectorOffset = sectorOffset
+			fmt.Printf("NTFS boot sector found at sector %d (offset 0x%X) during scan\n", offset, sectorOffset)
+			return sectorOffset, nil
+		}
+	}
+
+	return 0, fmt.Errorf("NTFS boot sector not found in first %d sectors", maxSectors)
+}
+
+// UpdateVolumeInfoFromBootSector reads NTFS volume parameters from the boot sector
+func (v *NTFSVolume) UpdateVolumeInfoFromBootSector(bootSectorOffset int64) error {
+	// Read the boot sector
+	bootSector := make([]byte, 512)
+	_, err := v.device.ReadAt(bootSector, bootSectorOffset)
+	if err != nil {
+		return fmt.Errorf("error reading boot sector: %v", err)
+	}
+
+	// Verify NTFS signature
+	if bootSector[3] != 'N' || bootSector[4] != 'T' || bootSector[5] != 'F' || bootSector[6] != 'S' {
+		return fmt.Errorf("invalid NTFS signature in boot sector")
+	}
+
+	// Parse boot sector fields
+	v.bytesPerSector = binary.LittleEndian.Uint16(bootSector[11:13])
+	v.sectorsPerCluster = bootSector[13]
+	v.hiddenSectors = binary.LittleEndian.Uint32(bootSector[28:32])
+	v.totalSectors = binary.LittleEndian.Uint64(bootSector[40:48])
+	v.mftStartLCN = binary.LittleEndian.Uint64(bootSector[48:56])
+	v.mftMirrStartLCN = binary.LittleEndian.Uint64(bootSector[56:64])
+
+	// Calculate derived values
+	v.bytesPerCluster = uint32(v.bytesPerSector) * uint32(v.sectorsPerCluster)
+	v.clusterCount = uint64(v.totalSectors) / uint64(v.sectorsPerCluster)
+	v.mftStartOffset = bootSectorOffset + int64(v.mftStartLCN)*int64(v.bytesPerCluster)
+
+	// Calculate MFT record size
+	clustersPerMFTRecord := bootSector[64]
+	if clustersPerMFTRecord&0x80 != 0 {
+		// Negative value (expressed as 2^(256-N) bytes)
+		v.mftRecordSize = 1 << (256 - uint8(clustersPerMFTRecord))
+	} else {
+		// Positive value (expressed as N clusters)
+		v.mftRecordSize = uint32(clustersPerMFTRecord) * v.bytesPerCluster
+	}
+
+	// For backward compatibility, also set these fields
+	v.sectorSize = uint32(v.bytesPerSector)
+	v.clusterSize = uint32(v.bytesPerCluster)
+	v.mftStart = v.mftStartLCN
+
+	return nil
+}
+
+// OpenVolume opens and initializes an NTFS volume, automatically detecting the boot sector
+func OpenVolume(devicePath string) (*NTFSVolume, error) {
+	volume := &NTFSVolume{
+		devicePath: devicePath,
+	}
+
+	// Open the volume file
+	file, err := os.Open(devicePath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening volume: %v", err)
+	}
+	volume.device = file
+
+	// Find the NTFS boot sector
+	bootSectorOffset, err := volume.FindNTFSBootSector()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// Update volume information from the boot sector
+	err = volume.UpdateVolumeInfoFromBootSector(bootSectorOffset)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// Log volume information for debugging
+	fmt.Printf("Volume information from boot sector:\n")
+	fmt.Printf("  Bytes per sector: %d\n", volume.bytesPerSector)
+	fmt.Printf("  Sectors per cluster: %d\n", volume.sectorsPerCluster)
+	fmt.Printf("  Bytes per cluster: %d\n", volume.bytesPerCluster)
+	fmt.Printf("  Total sectors: %d\n", volume.totalSectors)
+	fmt.Printf("  MFT start LCN: %d\n", volume.mftStartLCN)
+	fmt.Printf("  MFT start offset: 0x%X\n", volume.mftStartOffset)
+	fmt.Printf("  MFT record size: %d bytes\n", volume.mftRecordSize)
+
+	// Read MFT
+	if err := volume.readMFT(); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("error reading MFT: %v", err)
+	}
+
+	return volume, nil
+}
